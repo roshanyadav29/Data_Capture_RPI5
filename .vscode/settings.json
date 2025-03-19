@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "data_storage.h": "c"
+        "data_storage.h": "c",
+        "stdbool.h": "c"
     }
 }

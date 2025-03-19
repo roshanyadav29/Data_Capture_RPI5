@@ -5,7 +5,6 @@
 #include <string.h>
 #include <unistd.h>
 #include "../include/gpio_handler.h"
-#include "../include/buffer_manager.h"
 #include "../include/data_storage.h"
 #include "../include/utils.h"
 #include "../config.h"
@@ -17,11 +16,6 @@ static bool running = true;
 void handle_signal(int sig) {
     printf("Received signal %d, stopping capture...\n", sig);
     running = false;
-}
-
-// Callback function for processing captured data
-void process_data(uint8_t* data, size_t size) {
-    write_data_to_sd(data, size);
 }
 
 void print_usage(const char* program_name) {
@@ -54,7 +48,7 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    printf("Starting GPIO-based data capture at 8.192 MHz\n");
+    log_info("Starting GPIO-based data capture system");
     printf("Data pin: GPIO %d\n", GPIO_DATA_PIN);
     printf("Clock: %s\n", (clock_source == CLOCK_SOURCE_EXTERNAL) ? 
            "External (GPIO pin)" : "Internal PCM");
@@ -63,36 +57,65 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     
-    // Initialize subsystems
+    // Phase 1 - Initialize GPIO
+    log_info("Phase 1: Initializing hardware");
     gpio_init(clock_source);
-    if (!gpio_dma_init()) {
-        log_error("Failed to initialize DMA buffers");
-        return EXIT_FAILURE;
-    }
     
-    data_storage_init();
-    
-    // Start capture with callback
-    if (!gpio_start_capture(process_data)) {
-        log_error("Failed to start capture");
+    // Allocate RAM buffer for capture
+    if (!gpio_allocate_ram_buffer()) {
+        fprintf(stderr, "Failed to allocate %.2f MB RAM buffer. Check available memory.\n", 
+            (float)RAM_BUFFER_SIZE / (1024 * 1024));
         gpio_cleanup();
         return EXIT_FAILURE;
     }
     
-    log_info("Capture started. Press Ctrl+C to stop.");
+    // Phase 2 - RAM Capture
+    log_info("Phase 2: Starting RAM capture");
+    printf("Capturing data at 8.192 MHz...\n");
     
-    // Main loop - wait for termination signal
+    if (!gpio_start_capture()) {
+        log_error("Failed to start capture");
+        gpio_free_ram_buffer();
+        gpio_cleanup();
+        return EXIT_FAILURE;
+    }
+    
+    // Wait for capture to finish or be interrupted
     while (running) {
-        // Print current buffer usage periodically
-        printf("Buffer usage: %zu bytes\n", gpio_get_buffer_usage());
-        sleep(1);  // Update every second
+        // Just check if we're still capturing
+        if (!gpio_capture_is_running()) {
+            break;
+        }
+        sleep(1);
+    }
+
+    // Now stop the capture properly
+    gpio_stop_capture();
+    
+    // Phase 3 - Storage to SD Card
+    log_info("Phase 3: Writing data to SD card");
+    data_storage_init();
+    
+    // Get captured buffer
+    size_t captured_size;
+    uint8_t* captured_data = gpio_get_buffer(&captured_size);
+    
+    if (captured_data && captured_size > 0) {
+        printf("Writing %.2f MB of captured data to SD card...\n",
+               (float)captured_size / (1024 * 1024));
+        
+        // Write data to SD card
+        write_data_to_sd(captured_data, captured_size);
+        
+        printf("Data successfully stored to SD card.\n");
+    } else {
+        log_error("No data was captured");
     }
     
     // Cleanup
-    printf("Stopping capture...\n");
-    gpio_stop_capture();
-    gpio_cleanup();
     data_storage_finalize();
+    gpio_free_ram_buffer();
+    gpio_cleanup();
     
     log_info("Capture completed successfully");
     return EXIT_SUCCESS;

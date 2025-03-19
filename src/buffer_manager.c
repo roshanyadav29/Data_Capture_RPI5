@@ -1,103 +1,170 @@
 #include "../include/buffer_manager.h"
-#include <stdio.h>
+#include "../include/utils.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
-// Static buffer for raw buffer functions
-static uint8_t *raw_buffer = NULL;
-static size_t raw_buffer_size = 0;
-static size_t write_index = 0;
+// Buffer management variables
+static BufferChunk* buffer_chunks = NULL;
+static int total_chunks = 0;
+static int available_chunks = 0;
+static int current_write_chunk = 0;
 
-// Buffer struct functions
-void buffer_init(Buffer *buffer) {
-    if (buffer == NULL) {
+bool buffer_init(size_t chunk_size, int num_chunks) {
+    // Free any existing buffers
+    buffer_cleanup();
+    
+    // Allocate the array of chunks
+    buffer_chunks = (BufferChunk*)calloc(num_chunks, sizeof(BufferChunk));
+    if (!buffer_chunks) {
+        log_error("Failed to allocate buffer chunk array");
+        return false;
+    }
+    
+    // Allocate memory for each chunk
+    for (int i = 0; i < num_chunks; i++) {
+        buffer_chunks[i].data = (uint8_t*)malloc(chunk_size);
+        if (!buffer_chunks[i].data) {
+            log_error("Failed to allocate buffer chunk %d", i);
+            buffer_cleanup();
+            return false;
+        }
+        
+        buffer_chunks[i].size = chunk_size;
+        buffer_chunks[i].used = 0;
+        buffer_chunks[i].ready_for_writing = false;
+    }
+    
+    total_chunks = num_chunks;
+    available_chunks = num_chunks;
+    current_write_chunk = 0;
+    
+    log_info("Buffer manager initialized with %d chunks of %zu bytes each", 
+             num_chunks, chunk_size);
+    return true;
+}
+
+void buffer_cleanup(void) {
+    if (buffer_chunks) {
+        for (int i = 0; i < total_chunks; i++) {
+            if (buffer_chunks[i].data) {
+                free(buffer_chunks[i].data);
+                buffer_chunks[i].data = NULL;
+            }
+        }
+        
+        free(buffer_chunks);
+        buffer_chunks = NULL;
+    }
+    
+    total_chunks = 0;
+    available_chunks = 0;
+    current_write_chunk = 0;
+}
+
+BufferChunk* buffer_get_next_chunk(void) {
+    if (!buffer_chunks || available_chunks <= 0) {
+        return NULL;
+    }
+    
+    // Find the next available chunk for writing
+    int start_idx = current_write_chunk;
+    do {
+        if (!buffer_chunks[current_write_chunk].ready_for_writing) {
+            // Reset the chunk for reuse
+            buffer_chunks[current_write_chunk].used = 0;
+            return &buffer_chunks[current_write_chunk];
+        }
+        
+        // Move to next chunk
+        current_write_chunk = (current_write_chunk + 1) % total_chunks;
+    } while (current_write_chunk != start_idx);
+    
+    // If we got here, all chunks are marked as ready for writing
+    return NULL;
+}
+
+void buffer_release_chunk(BufferChunk* chunk) {
+    if (!chunk || !buffer_chunks) {
         return;
     }
     
-    buffer->write_index = 0;
-    buffer->read_index = 0;
-    buffer->size = 0;
-    memset(buffer->data, 0, BUFFER_SIZE);
+    // Find the chunk in our array
+    for (int i = 0; i < total_chunks; i++) {
+        if (&buffer_chunks[i] == chunk) {
+            buffer_chunks[i].ready_for_writing = true;
+            available_chunks--; // Add this line to update available chunks
+            break;
+        }
+    }
 }
 
-void buffer_write(Buffer *buffer, const uint8_t *data, size_t length) {
-    if (buffer == NULL || data == NULL) {
+void buffer_mark_chunk_processed(BufferChunk* chunk) {
+    if (!chunk || !buffer_chunks) {
         return;
     }
     
-    // Only write what fits in the buffer
-    size_t available = BUFFER_SIZE - buffer->size;
-    size_t to_write = (length > available) ? available : length;
-    
-    for (size_t i = 0; i < to_write; i++) {
-        buffer->data[(buffer->write_index + i) % BUFFER_SIZE] = data[i];
+    for (int i = 0; i < total_chunks; i++) {
+        if (&buffer_chunks[i] == chunk) {
+            buffer_chunks[i].ready_for_writing = false;
+            available_chunks++;
+            break;
+        }
     }
-    
-    buffer->write_index = (buffer->write_index + to_write) % BUFFER_SIZE;
-    buffer->size += to_write;
 }
 
-size_t buffer_read(Buffer *buffer, uint8_t *data, size_t length) {
-    if (buffer == NULL || data == NULL || buffer->size == 0) {
+bool buffer_is_full(void) {
+    return available_chunks <= 0;
+}
+
+size_t buffer_get_total_size(void) {
+    if (!buffer_chunks) {
         return 0;
     }
     
-    size_t to_read = (length > buffer->size) ? buffer->size : length;
-    
-    for (size_t i = 0; i < to_read; i++) {
-        data[i] = buffer->data[(buffer->read_index + i) % BUFFER_SIZE];
+    return total_chunks * buffer_chunks[0].size;
+}
+
+size_t buffer_get_used_size(void) {
+    if (!buffer_chunks) {
+        return 0;
     }
     
-    buffer->read_index = (buffer->read_index + to_read) % BUFFER_SIZE;
-    buffer->size -= to_read;
+    size_t used = 0;
+    for (int i = 0; i < total_chunks; i++) {
+        if (buffer_chunks[i].ready_for_writing) {
+            used += buffer_chunks[i].used;
+        }
+    }
     
-    return to_read;
+    return used;
 }
 
-int buffer_is_full(Buffer *buffer) {
-    return (buffer != NULL && buffer->size >= BUFFER_SIZE);
+int buffer_get_available_chunks(void) {
+    return available_chunks;
 }
 
-int buffer_is_empty(Buffer *buffer) {
-    return (buffer == NULL || buffer->size == 0);
-}
-
-// Raw buffer functions
-int init_buffer(size_t size) {
-    if (raw_buffer != NULL) {
-        free(raw_buffer);
+bool buffer_copy_all_data(uint8_t* dest_buffer, size_t buffer_size) {
+    if (!dest_buffer || !buffer_chunks) {
+        return false;
     }
-    raw_buffer = (uint8_t *)malloc(size);
-    if (raw_buffer == NULL) {
-        return -1; // Memory allocation failed
+    
+    size_t total_used = buffer_get_used_size();
+    if (buffer_size < total_used) {
+        return false;
     }
-    raw_buffer_size = size;
-    write_index = 0;
-    return 0; // Success
-}
-
-int write_to_buffer(const uint8_t *data, size_t length) {
-    if (write_index + length > raw_buffer_size) {
-        return -1; // Not enough space in buffer
+    
+    // Copy data from all chunks marked as ready for writing
+    size_t offset = 0;
+    for (int i = 0; i < total_chunks; i++) {
+        if (buffer_chunks[i].ready_for_writing) {
+            memcpy(dest_buffer + offset, buffer_chunks[i].data, buffer_chunks[i].used);
+            offset += buffer_chunks[i].used;
+            
+            // Mark chunk as processed to recycle it
+            buffer_mark_chunk_processed(&buffer_chunks[i]);
+        }
     }
-    memcpy(raw_buffer + write_index, data, length);
-    write_index += length;
-    return 0; // Success
-}
-
-size_t read_from_buffer(uint8_t *out_data, size_t length) {
-    size_t read_length = (length > write_index) ? write_index : length;
-    memcpy(out_data, raw_buffer, read_length);
-    memmove(raw_buffer, raw_buffer + read_length, write_index - read_length);
-    write_index -= read_length;
-    return read_length; // Number of bytes read
-}
-
-void free_buffer(void) {
-    if (raw_buffer != NULL) {
-        free(raw_buffer);
-        raw_buffer = NULL;
-        raw_buffer_size = 0;
-        write_index = 0;
-    }
+    
+    return true;
 }

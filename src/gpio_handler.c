@@ -9,26 +9,28 @@
 #include <pthread.h>
 #include <poll.h>
 #include <time.h>
+#include "../include/buffer_manager.h"
 
 // Memory mapped GPIO
 static volatile uint32_t *gpio_map = NULL;
 static volatile uint32_t *pcm_map = NULL;
 static int mem_fd = -1;
 
-// DMA buffers and state
-static uint8_t *dma_buffers[NUM_DMA_BUFFERS];
-static int current_write_buffer = 0;
-static int current_read_buffer = 0;
-static size_t buffer_position = 0;
+// RAM buffer for data capture
+static BufferChunk* current_chunk = NULL;
+static int buffer_chunk_index = 0;
 static bool capture_running = false;
+static size_t total_bytes_captured = 0;
 
-// Worker thread for handling buffer rotation
-static pthread_t worker_thread;
+// Capture thread
 static pthread_t capture_thread;
-static void (*data_ready_callback)(uint8_t*, size_t) = NULL;
 
 // Clock source setting
 static ClockSource current_clock_source;
+
+// Performance monitoring
+static struct timespec capture_start_time;
+static struct timespec capture_end_time;
 
 // GPIO register offsets
 #define GPFSEL   0x00  // Function select registers
@@ -38,21 +40,14 @@ static ClockSource current_clock_source;
 #define GPEDS    0x40  // Event detect status registers
 #define GPREN    0x4C  // Rising edge detect enable registers
 #define GPFEN    0x58  // Falling edge detect enable registers
-#define GPHEN    0x64  // High detect enable registers
-#define GPLEN    0x70  // Low detect enable registers
-#define GPAREN   0x7C  // Async rising edge detect registers
-#define GPAFEN   0x88  // Async falling edge detect registers
+
+// PCM registers base address
+#define PCM_BASE 0xFE203000
 
 // PCM register offsets
 #define PCM_CS     0x00  // Control and status
 #define PCM_FIFO   0x04  // FIFO data
 #define PCM_MODE   0x08  // Mode
-#define PCM_RXC    0x0C  // Receive config
-#define PCM_TXC    0x10  // Transmit config
-#define PCM_DREQ   0x14  // DMA request level
-#define PCM_INTEN  0x18  // Interrupt enables
-#define PCM_INTSTC 0x1C  // Interrupt status & clear
-#define PCM_GRAY   0x20  // Gray mode control
 
 // For sysfs GPIO edge detection
 static char gpio_edge_path[64];
@@ -136,7 +131,6 @@ void gpio_init(ClockSource clock_source) {
         printf("GPIO %d configured as external clock input with rising edge detection\n", GPIO_CLOCK_PIN);
         
         // Alternative: Set up edge detection using sysfs for more reliable interrupt handling
-        // Export the GPIO
         int export_fd = open("/sys/class/gpio/export", O_WRONLY);
         if (export_fd >= 0) {
             char gpio_str[4];
@@ -172,10 +166,8 @@ void gpio_init(ClockSource clock_source) {
         pcm_map[PCM_CS/4] = 0;
         usleep(100);
         
-        // Set up PCM clock - this requires understanding the exact clock divider calculation
-        // For example (assuming 500MHz core clock):
-        // 500MHz / 61 = 8.196MHz (close to 8.192MHz)
-        pcm_map[PCM_MODE/4] = (61 << 10); // Set clock divider
+        // Set up PCM clock - assuming 500MHz core clock
+        pcm_map[PCM_MODE/4] = (61 << 10); // 500MHz / 61 ≈ 8.196MHz
         
         // Enable PCM with appropriate settings
         pcm_map[PCM_CS/4] = 1; // Enable PCM
@@ -184,13 +176,33 @@ void gpio_init(ClockSource clock_source) {
     }
 }
 
+// Allocate RAM buffer for 1-minute capture
+bool gpio_allocate_ram_buffer(void) {
+    printf("Initializing buffer manager for %.2f MB of data...\n", 
+           (float)RAM_BUFFER_SIZE / (1024 * 1024));
+    
+    // Calculate number of chunks needed (1MB per chunk)
+    int num_chunks = (RAM_BUFFER_SIZE / (1024 * 1024)) + 1;
+    return buffer_init(1024 * 1024, num_chunks);
+}
+
+// Free RAM buffer
+void gpio_free_ram_buffer(void) {
+    if (current_chunk) {
+        buffer_release_chunk(current_chunk);
+        current_chunk = NULL;
+    }
+}
+
 // External clock capture thread
 static void* external_clock_capture_thread(void* arg) {
     struct pollfd pfd;
     char value[2];
-    uint8_t* current_buffer = dma_buffers[current_write_buffer];
     int bit_count = 0;
     uint8_t byte_value = 0;
+    unsigned long sample_counter = 0;
+    struct timespec last_report_time;
+    int time_check_counter = 0; // Add this line
     
     // Calculate which register and bit to read
     int reg_offset = GPLEV/4;          // GPLEV register offset (divided by 4 for 32-bit access)
@@ -207,17 +219,19 @@ static void* external_clock_capture_thread(void* arg) {
         lseek(gpio_fd, 0, SEEK_SET);
         read(gpio_fd, value, 1);
     }
+
+    // Get start time
+    clock_gettime(CLOCK_MONOTONIC, &capture_start_time);
+    last_report_time = capture_start_time;
     
-    // Add these variables for performance monitoring
-    unsigned long sample_counter = 0;
-    time_t last_report_time = time(NULL);
+    printf("Starting 1-minute data capture...\n");
     
-    while (capture_running) {
+    while (capture_running && total_bytes_captured < RAM_BUFFER_SIZE) {
         bool edge_detected = false;
         
         if (gpio_fd >= 0) {
             // Use sysfs polling approach
-            if (poll(&pfd, 1, 100) > 0) {  // 100ms timeout
+            if (poll(&pfd, 1, 10) > 0) {  // 10ms timeout to reduce potential missed samples
                 if (pfd.revents & POLLPRI) {
                     // Clock edge detected
                     lseek(gpio_fd, 0, SEEK_SET);
@@ -243,65 +257,104 @@ static void* external_clock_capture_thread(void* arg) {
             bit_count++;
             
             if (bit_count == 8) {
-                // Got a complete byte, store it
-                current_buffer[buffer_position++] = byte_value;
+                // Got a complete byte, check if current chunk is full
+                if (!current_chunk || current_chunk->used >= current_chunk->size) {
+                    // Release current chunk if it exists
+                    if (current_chunk) {
+                        current_chunk->ready_for_writing = true;
+                        buffer_release_chunk(current_chunk);
+                    }
+                    
+                    // Get next chunk
+                    current_chunk = buffer_get_next_chunk();
+                    if (!current_chunk) {
+                        capture_running = false;
+                        printf("Buffer full, stopping capture\n");
+                        break;
+                    }
+                }
+                
+                // Store byte in current chunk
+                current_chunk->data[current_chunk->used++] = byte_value;
+                total_bytes_captured++;
                 bit_count = 0;
                 byte_value = 0;
                 
-                // Check if buffer is full
-                if (buffer_position >= DMA_BUFFER_SIZE) {
-                    // Advance to next buffer
-                    current_write_buffer = (current_write_buffer + 1) % NUM_DMA_BUFFERS;
+                // Increment sample counter
+                sample_counter++;
+            }
+            
+            // Only check time periodically to improve performance
+            if (++time_check_counter >= 1000) {
+                time_check_counter = 0;
+                
+                struct timespec current_time; // This declaration is missing
+                clock_gettime(CLOCK_MONOTONIC, &current_time);
+                double elapsed = (current_time.tv_sec - last_report_time.tv_sec) + 
+                                (current_time.tv_nsec - last_report_time.tv_nsec) / 1000000000.0;
+                
+                if (elapsed >= 5.0) {
+                    double total_elapsed = (current_time.tv_sec - capture_start_time.tv_sec) + 
+                                          (current_time.tv_nsec - capture_start_time.tv_nsec) / 1000000000.0;
                     
-                    // Check if we're about to overwrite unprocessed data
-                    if (current_write_buffer == current_read_buffer) {
-                        fprintf(stderr, "Buffer overflow - data is being captured faster than it can be processed\n");
-                        // Skip one buffer
-                        current_read_buffer = (current_read_buffer + 1) % NUM_DMA_BUFFERS;
+                    double bytes_per_second = sample_counter / elapsed;
+                    double expected_rate = BYTES_PER_SECOND;
+                    double efficiency = (bytes_per_second / expected_rate) * 100.0;
+                    
+                    printf("Capture progress: %.1f seconds (%.1f%%) - %.2f KB/sec (%.1f%% of target)\n", 
+                           total_elapsed, (total_elapsed / CAPTURE_SECONDS) * 100,
+                           bytes_per_second / 1024, efficiency);
+                    
+                    // Reset counter for next interval
+                    sample_counter = 0;
+                    last_report_time = current_time;
+                    
+                    // Check if we've reached 1 minute or buffer is full
+                    if (total_elapsed >= CAPTURE_SECONDS || total_bytes_captured >= RAM_BUFFER_SIZE) {
+                        capture_running = false;
+                        break;
                     }
-                    
-                    current_buffer = dma_buffers[current_write_buffer];
-                    buffer_position = 0;
                 }
             }
-            
-            // Increment sample counter
-            sample_counter++;
-            
-            // Report performance every 10 seconds
-            time_t current_time = time(NULL);
-            if (current_time - last_report_time >= 10) {
-                float samples_per_second = sample_counter / 10.0f;
-                float expected_rate = TARGET_SAMPLE_RATE / 8.0f; // Bytes per second
-                float efficiency = (samples_per_second / expected_rate) * 100.0f;
-                
-                printf("Performance: %.2f bytes/sec (%.1f%% of target)\n", 
-                       samples_per_second, efficiency);
-                
-                // Reset counter
-                sample_counter = 0;
-                last_report_time = current_time;
-            }
         }
+    }
+    
+    // Record end time
+    clock_gettime(CLOCK_MONOTONIC, &capture_end_time);
+    
+    // If we exited due to full buffer, report it
+    if (total_bytes_captured >= RAM_BUFFER_SIZE) {
+        printf("RAM buffer capacity reached (%.2f MB). Stopping capture.\n",
+               (float)total_bytes_captured / (1024 * 1024));
+    }
+    
+    if (current_chunk && current_chunk->used > 0) {
+        current_chunk->ready_for_writing = true;
+        // Don't release it here, just mark it for writing
     }
     
     return NULL;
 }
 
-// PCM clock capture thread
+// PCM clock capture thread (similar modifications for PCM clock)
 static void* pcm_clock_capture_thread(void* arg) {
-    uint8_t* current_buffer = dma_buffers[current_write_buffer];
     int bit_count = 0;
     uint8_t byte_value = 0;
+    unsigned long sample_counter = 0;
+    struct timespec last_report_time;
     
     // Calculate which register and bit to read
     int reg_offset = GPLEV/4;  // GPLEV register offset
     int data_bit = 1 << (GPIO_DATA_PIN % 32);  // Bit mask for our data pin
     
-    while (capture_running) {
-        // Wait for PCM clock cycle - this would be synchronized with the PCM hardware
-        // In practice, we would need to use interrupts or DMA with the PCM clock
-        // For now, we just check PCM status
+    // Get start time
+    clock_gettime(CLOCK_MONOTONIC, &capture_start_time);
+    last_report_time = capture_start_time;
+    
+    printf("Starting 1-minute data capture with PCM clock...\n");
+    
+    while (capture_running && total_bytes_captured < RAM_BUFFER_SIZE) {
+        // Wait for PCM clock cycle
         if (pcm_map[PCM_CS/4] & (1 << 5)) { // Check PCM_CS.RXREADY flag
             // Read data pin on clock edge
             uint32_t level = (gpio_map[reg_offset] & data_bit) ? 1 : 0;
@@ -311,109 +364,96 @@ static void* pcm_clock_capture_thread(void* arg) {
             bit_count++;
             
             if (bit_count == 8) {
-                // Got a complete byte, store it
-                current_buffer[buffer_position++] = byte_value;
+                // Got a complete byte, check if current chunk is full
+                if (!current_chunk || current_chunk->used >= current_chunk->size) {
+                    // Release current chunk if it exists
+                    if (current_chunk) {
+                        current_chunk->ready_for_writing = true;
+                        buffer_release_chunk(current_chunk);
+                    }
+                    
+                    // Get next chunk
+                    current_chunk = buffer_get_next_chunk();
+                    if (!current_chunk) {
+                        capture_running = false;
+                        printf("Buffer full, stopping capture\n");
+                        break;
+                    }
+                }
+                
+                // Store byte in current chunk
+                current_chunk->data[current_chunk->used++] = byte_value;
+                total_bytes_captured++;
                 bit_count = 0;
                 byte_value = 0;
                 
-                // Check if buffer is full
-                if (buffer_position >= DMA_BUFFER_SIZE) {
-                    // Advance to next buffer
-                    current_write_buffer = (current_write_buffer + 1) % NUM_DMA_BUFFERS;
-                    
-                    // Check if we're about to overwrite unprocessed data
-                    if (current_write_buffer == current_read_buffer) {
-                        fprintf(stderr, "Buffer overflow - data is being captured faster than it can be processed\n");
-                        // Skip one buffer
-                        current_read_buffer = (current_read_buffer + 1) % NUM_DMA_BUFFERS;
-                    }
-                    
-                    current_buffer = dma_buffers[current_write_buffer];
-                    buffer_position = 0;
+                // Increment sample counter
+                sample_counter++;
+            }
+            
+            // Report progress every 5 seconds
+            struct timespec current_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            double elapsed = (current_time.tv_sec - last_report_time.tv_sec) + 
+                            (current_time.tv_nsec - last_report_time.tv_nsec) / 1000000000.0;
+            
+            if (elapsed >= 5.0) {
+                double total_elapsed = (current_time.tv_sec - capture_start_time.tv_sec) + 
+                                      (current_time.tv_nsec - capture_start_time.tv_nsec) / 1000000000.0;
+                
+                double bytes_per_second = sample_counter / elapsed;
+                double expected_rate = BYTES_PER_SECOND;
+                double efficiency = (bytes_per_second / expected_rate) * 100.0;
+                
+                printf("Capture progress: %.1f seconds (%.1f%%) - %.2f KB/sec (%.1f%% of target)\n", 
+                       total_elapsed, (total_elapsed / CAPTURE_SECONDS) * 100,
+                       bytes_per_second / 1024, efficiency);
+                
+                // Reset counter for next interval
+                sample_counter = 0;
+                last_report_time = current_time;
+                
+                // Check if we've reached 1 minute or buffer is full
+                if (total_elapsed >= CAPTURE_SECONDS || total_bytes_captured >= RAM_BUFFER_SIZE) {
+                    capture_running = false;
+                    break;
                 }
             }
         }
     }
     
-    return NULL;
-}
-
-// Initialize DMA buffers
-bool gpio_dma_init(void) {
-    // Allocate DMA buffers
-    for (int i = 0; i < NUM_DMA_BUFFERS; i++) {
-        dma_buffers[i] = (uint8_t*)malloc(DMA_BUFFER_SIZE);
-        if (dma_buffers[i] == NULL) {
-            // Free previously allocated buffers
-            for (int j = 0; j < i; j++) {
-                free(dma_buffers[j]);
-                dma_buffers[j] = NULL;
-            }
-            fprintf(stderr, "Failed to allocate DMA buffer %d\n", i);
-            return false;
-        }
-        // Zero out the buffer
-        memset(dma_buffers[i], 0, DMA_BUFFER_SIZE);
-    }
+    // Record end time
+    clock_gettime(CLOCK_MONOTONIC, &capture_end_time);
     
-    current_write_buffer = 0;
-    current_read_buffer = 0;
-    buffer_position = 0;
-    
-    printf("DMA buffers initialized: %d buffers of %d bytes each\n", 
-           NUM_DMA_BUFFERS, DMA_BUFFER_SIZE);
-    
-    return true;
-}
-
-// Worker thread function to process filled buffers
-static void* buffer_processor(void* arg) {
-    while (capture_running) {
-        // Check if a buffer is full and needs processing
-        if (current_read_buffer != current_write_buffer) {
-            // Call the callback function with the filled buffer
-            if (data_ready_callback != NULL) {
-                data_ready_callback(dma_buffers[current_read_buffer], DMA_BUFFER_SIZE);
-            }
-            
-            // Move to next buffer
-            current_read_buffer = (current_read_buffer + 1) % NUM_DMA_BUFFERS;
-        } else {
-            // No buffers to process, sleep briefly
-            usleep(THREAD_SLEEP_US); 
-        }
+    if (current_chunk && current_chunk->used > 0) {
+        current_chunk->ready_for_writing = true;
+        // Don't release it here, just mark it for writing
     }
     
     return NULL;
 }
 
 // Start high-speed capture
-bool gpio_start_capture(void (*callback)(uint8_t*, size_t)) {
+bool gpio_start_capture(void) {
     if (gpio_map == NULL) {
         fprintf(stderr, "GPIO not initialized\n");
         return false;
     }
     
-    // Store the callback
-    data_ready_callback = callback;
+    if (buffer_get_total_size() == 0) {
+        fprintf(stderr, "RAM buffer not allocated\n");
+        return false;
+    }
     
     // Set up for capture
     capture_running = true;
-    
-    // Start the worker thread for processing buffers
-    if (pthread_create(&worker_thread, NULL, buffer_processor, NULL) != 0) {
-        fprintf(stderr, "Failed to create worker thread\n");
-        capture_running = false;
-        return false;
-    }
+    total_bytes_captured = 0;
     
     // Start the appropriate capture thread based on clock source
     if (current_clock_source == CLOCK_SOURCE_EXTERNAL) {
         if (pthread_create(&capture_thread, NULL, external_clock_capture_thread, NULL) != 0) {
             fprintf(stderr, "Failed to create capture thread\n");
             capture_running = false;
-            pthread_cancel(worker_thread);
-            pthread_join(worker_thread, NULL);
             return false;
         }
         printf("GPIO capture started with external clock on GPIO %d\n", GPIO_CLOCK_PIN);
@@ -421,8 +461,6 @@ bool gpio_start_capture(void (*callback)(uint8_t*, size_t)) {
         if (pthread_create(&capture_thread, NULL, pcm_clock_capture_thread, NULL) != 0) {
             fprintf(stderr, "Failed to create capture thread\n");
             capture_running = false;
-            pthread_cancel(worker_thread);
-            pthread_join(worker_thread, NULL);
             return false;
         }
         printf("GPIO capture started with PCM hardware clock\n");
@@ -437,20 +475,69 @@ bool gpio_stop_capture(void) {
         return true;
     }
     
-    // Signal threads to stop
+    // Signal thread to stop
     capture_running = false;
     
-    // Wait for threads to terminate
+    // Wait for thread to terminate
     pthread_join(capture_thread, NULL);
-    pthread_join(worker_thread, NULL);
     
-    // Process any remaining data in the current buffer
-    if (buffer_position > 0 && data_ready_callback != NULL) {
-        data_ready_callback(dma_buffers[current_write_buffer], buffer_position);
+    // Calculate actual sample rate
+    double elapsed = (capture_end_time.tv_sec - capture_start_time.tv_sec) + 
+                    (capture_end_time.tv_nsec - capture_start_time.tv_nsec) / 1000000000.0;
+    double bytes_per_second = total_bytes_captured / elapsed;
+    double bits_per_second = bytes_per_second * 8;
+    
+    printf("Capture completed:\n");
+    printf("  Bytes captured: %zu (%.2f MB)\n", 
+           total_bytes_captured, (float)total_bytes_captured / (1024 * 1024));
+    printf("  Duration: %.2f seconds\n", elapsed);
+    printf("  Average rate: %.2f MHz (%.1f%% of target)\n", 
+           bits_per_second / 1000000, 
+           (bits_per_second / TARGET_SAMPLE_RATE) * 100);
+    
+    return true;
+}
+
+bool gpio_capture_is_running(void) {
+    return capture_running;
+}
+
+// This function needs complete rewriting to copy data from all chunks
+uint8_t* gpio_get_buffer(size_t *size) {
+    // WARNING: This function returns a pointer to a static buffer that will be freed
+    // on subsequent calls. The caller should process or copy the data before calling
+    // this function again.
+    static uint8_t* output_buffer = NULL;
+    
+    // Free any previously allocated buffer
+    if (output_buffer != NULL) {
+        free(output_buffer);
+        output_buffer = NULL;
     }
     
-    printf("GPIO capture stopped\n");
-    return true;
+    size_t total_size = buffer_get_used_size();
+    if (size) {
+        *size = total_size;
+    }
+    
+    if (total_size == 0) {
+        return NULL;
+    }
+    
+    // Allocate new buffer
+    output_buffer = (uint8_t*)malloc(total_size);
+    if (!output_buffer) {
+        fprintf(stderr, "Failed to allocate memory for output buffer\n");
+        return NULL;
+    }
+    
+    if (!buffer_copy_all_data(output_buffer, total_size)) {
+        fprintf(stderr, "Failed to copy data from buffer chunks\n");
+        free(output_buffer);
+        return NULL;
+    }
+    
+    return output_buffer;
 }
 
 // Clean up GPIO resources
@@ -485,17 +572,9 @@ void gpio_cleanup(void) {
     }
 }
 
-// Get current buffer usage
-size_t gpio_get_buffer_usage(void) {
-    if (current_write_buffer == current_read_buffer) {
-        return buffer_position;
-    } else {
-        return (NUM_DMA_BUFFERS - 1) * DMA_BUFFER_SIZE + buffer_position;
-    }
-}
-
 // Get actual sample rate
 uint32_t gpio_get_actual_sample_rate(void) {
-    // In a real implementation, you would measure the actual achieved rate
-    return TARGET_SAMPLE_RATE;
+    double elapsed = (capture_end_time.tv_sec - capture_start_time.tv_sec) + 
+                    (capture_end_time.tv_nsec - capture_start_time.tv_nsec) / 1000000000.0;
+    return (uint32_t)((total_bytes_captured * 8) / elapsed);
 }
