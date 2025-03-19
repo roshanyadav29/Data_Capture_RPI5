@@ -1,3 +1,4 @@
+# Raspberry Pi 5 GPIO Sampler Makefile
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -I./include
 LDFLAGS = -pthread
