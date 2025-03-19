@@ -18,7 +18,6 @@ static int mem_fd = -1;
 
 // RAM buffer for data capture
 static BufferChunk* current_chunk = NULL;
-static int buffer_chunk_index = 0;
 static bool capture_running = false;
 static size_t total_bytes_captured = 0;
 
@@ -196,6 +195,7 @@ void gpio_free_ram_buffer(void) {
 
 // External clock capture thread
 static void* external_clock_capture_thread(void* arg) {
+    (void)arg;  // Add this line to suppress the warning
     struct pollfd pfd;
     char value[2];
     int bit_count = 0;
@@ -338,6 +338,7 @@ static void* external_clock_capture_thread(void* arg) {
 
 // PCM clock capture thread (similar modifications for PCM clock)
 static void* pcm_clock_capture_thread(void* arg) {
+    (void)arg;  // Add this line to suppress the warning
     int bit_count = 0;
     uint8_t byte_value = 0;
     unsigned long sample_counter = 0;
@@ -578,3 +579,21 @@ uint32_t gpio_get_actual_sample_rate(void) {
                     (capture_end_time.tv_nsec - capture_start_time.tv_nsec) / 1000000000.0;
     return (uint32_t)((total_bytes_captured * 8) / elapsed);
 }
+
+#ifdef DRY_RUN
+// Mock functions that simulate hardware behavior
+int mock_gpio_read() {
+    static int counter = 0;
+    counter++;
+    // Generate test pattern
+    return counter % 256;
+}
+
+bool setup_gpio_mapping() {
+    // Skip real hardware access
+    log_info("Mock GPIO setup completed");
+    return true;
+}
+
+// Other mocked functions...
+#endif

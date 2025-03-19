@@ -21,4 +21,7 @@ clean:
 run: $(TARGET)
     sudo ./$(TARGET)
 
-.PHONY: all clean run
+test:
+    $(CC) $(CFLAGS) -DDRY_RUN -o gpio_sampler_test $(SRC_FILES) $(LIBS)
+
+.PHONY: all clean run test
