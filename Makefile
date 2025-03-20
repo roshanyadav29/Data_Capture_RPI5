@@ -10,18 +10,18 @@ TARGET = gpio_sampler
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-    $(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
-    $(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-    rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET)
 
 run: $(TARGET)
-    sudo ./$(TARGET)
+	sudo ./$(TARGET)
 
 test:
-    $(CC) $(CFLAGS) -DDRY_RUN -o gpio_sampler_test $(SRC_FILES) $(LIBS)
+	$(CC) $(CFLAGS) -DDRY_RUN -o gpio_sampler_test $(SRC_FILES) $(LIBS)
 
 .PHONY: all clean run test
