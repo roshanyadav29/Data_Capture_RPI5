@@ -2,16 +2,15 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Test Build",
+            "name": "Build & Run",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/gpio_sampler_test",
-            "args": ["--dry-run"],
+            "program": "${workspaceFolder}/gpio_sampler",
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
             "externalConsole": false,
-            "preLaunchTask": "test"
+            "preLaunchTask": "build"
         }
     ]
 }

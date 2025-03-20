@@ -1,21 +1,19 @@
 # Raspberry Pi 5 GPIO Sampler
 
 ## Overview
-This project implements high-speed digital data capture (8.192 MHz) from Raspberry Pi 5 GPIO pins. It can use either an external clock for precise timing or the internal PCM hardware clock.
+This project implements high-speed digital data capture (8.192 MHz) from Raspberry Pi 5 GPIO pins using an external clock for precise timing.
 
 ## Features
 - High-speed data sampling at 8.192 MHz
-- Two clock options:
-  - External clock for perfect synchronization
-  - Internal PCM clock for standalone operation
+- External clock for perfect synchronization
 - Efficient RAM buffering (8MB in 1MB chunks)
 - SD card storage for captured data
 
 ## Hardware Requirements
 - Raspberry Pi 5
-- External clock source (for external clock mode)
+- External clock source at 8.192 MHz
 - Data source connected to GPIO pin 17
-- Clock source connected to GPIO pin 18 (for external clock mode)
+- Clock source connected to GPIO pin 18
 
 ## Building the Project
 ```bash
@@ -33,7 +31,7 @@ make run
 ## Configuration
 All configuration parameters are defined in [config.h](config.h):
 
-- Sampling rate: 8.192 MHz by default
+- Sampling rate: 8.192 MHz (defined by external clock)
 - GPIO pins: Data pin (17) and Clock pin (18)
 - Buffer size: 1MB chunks, 8 buffers total (8MB RAM buffer)
 - Storage location: `/home/pi/gpio_data` by default
@@ -58,6 +56,6 @@ To modify these settings, edit the config.h file before building.
 
 ## Troubleshooting
 - Ensure GPIO pins are correctly connected
-- Verify that the external clock signal is stable (if using external clock)
+- Verify that the external clock signal is stable and at the correct frequency
 - Check that the application has sufficient permissions to access hardware
 - Ensure adequate free space on the SD card

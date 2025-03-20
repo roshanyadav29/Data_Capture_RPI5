@@ -7,7 +7,7 @@
 // Target sampling frequency
 #define TARGET_SAMPLE_RATE 8192000 // 8.192 MHz
 
-// Calculate buffer size for 1 minute of data
+// Calculate buffer size for configured capture duration
 // (8.192 MHz / 8 bits per byte) * 60 seconds = ~61.44 MB
 #define BYTES_PER_SECOND (TARGET_SAMPLE_RATE / 8)
 #define CAPTURE_SECONDS 300

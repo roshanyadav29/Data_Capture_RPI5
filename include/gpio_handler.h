@@ -6,16 +6,11 @@
 #include <stddef.h>
 #include "../config.h"
 
-typedef enum {
-    CLOCK_SOURCE_EXTERNAL, // Use external clock on GPIO pin
-    CLOCK_SOURCE_PCM       // Use internal PCM hardware clock
-} ClockSource;
-
 // Function prototypes - GPIO setup
-void gpio_init(ClockSource clock_source);
+void gpio_init(void);
 void gpio_cleanup(void);
 
-// RAM buffer for 1-minute capture
+// RAM buffer for capture
 bool gpio_allocate_ram_buffer(void);
 void gpio_free_ram_buffer(void);
 
