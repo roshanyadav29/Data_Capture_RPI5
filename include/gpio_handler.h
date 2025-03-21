@@ -22,4 +22,7 @@ uint32_t gpio_get_actual_sample_rate(void);
 
 bool gpio_capture_is_running(void);
 
+// Debug functions
+bool gpio_debug_clock_signal(int seconds);
+
 #endif // GPIO_HANDLER_H

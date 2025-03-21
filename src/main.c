@@ -49,6 +49,21 @@ int main(int argc, char *argv[]) {
     log_info("Phase 1: Initializing hardware");
     gpio_init();
     
+    // Run a quick clock signal test
+    printf("Testing clock signal for 5 seconds...\n");
+    if (!gpio_debug_clock_signal(5)) {
+        printf("Warning: Clock signal appears unstable or below target rate!\n");
+        printf("Proceeding with capture anyway, but results may be affected.\n");
+        printf("Press Ctrl+C within 3 seconds to abort...\n");
+        sleep(3);
+        if (!running) {
+            gpio_cleanup();
+            return EXIT_SUCCESS;
+        }
+    } else {
+        printf("Clock signal looks good! Proceeding with capture.\n");
+    }
+    
     // Allocate RAM buffer for capture
     if (!gpio_allocate_ram_buffer()) {
         fprintf(stderr, "Failed to allocate %.2f MB RAM buffer. Check available memory.\n", 
