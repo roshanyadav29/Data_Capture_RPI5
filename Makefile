@@ -1,6 +1,6 @@
-# Raspberry Pi 5 GPIO Sampler Makefile
+# Raspberry Pi 4 GPIO Sampler Makefile
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -I./include
+CFLAGS = -Wall -Wextra -O2 -I./include -D_GNU_SOURCE
 LDFLAGS = -pthread
 
 SRC = src/main.c src/gpio_handler.c src/buffer_manager.c src/data_storage.c src/utils.c
@@ -21,4 +21,4 @@ clean:
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-.PHONY: all clean run test
+.PHONY: all clean run

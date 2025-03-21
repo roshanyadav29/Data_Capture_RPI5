@@ -11,6 +11,9 @@
 #include <time.h>
 #include "../include/buffer_manager.h"
 #include "../include/utils.h"
+#include <pthread.h>    // For thread functions
+#define _GNU_SOURCE     // Required for CPU affinity functions
+#include <sys/types.h>  // For basic types
 
 // Memory mapped GPIO
 static volatile uint32_t *gpio_map = NULL;
@@ -43,9 +46,6 @@ static struct timespec last_report_time;
 // For sysfs GPIO edge detection
 static char gpio_edge_path[64];
 static int gpio_fd = -1;
-
-// RPi 4 peripheral base address
-#define BCM2711_PERI_BASE        0xFE000000
 
 // GPIO controller
 #define GPIO_BASE               (BCM2711_PERI_BASE + 0x200000)
@@ -528,7 +528,7 @@ bool gpio_debug_clock_signal(int seconds) {
             double rate = edge_count / elapsed;
             printf("Clock rate: %.2f MHz\n", rate / 1000000.0);
         }
-            }
+    }
     
     double total_elapsed = (current_time.tv_sec - start_time.tv_sec) + 
                           (current_time.tv_nsec - start_time.tv_nsec) / 1000000000.0;
