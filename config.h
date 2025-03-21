@@ -19,7 +19,9 @@
 // GPIO configuration parameters
 #define GPIO_DATA_PIN 17     // GPIO pin for data input
 #define GPIO_CLOCK_PIN 18    // GPIO pin for external clock input
-#define GPIO_BASE 0xFE200000 // Raspberry Pi 5's GPIO base address
+
+// Update the GPIO base address in your config.h or override it here
+#define GPIO_BASE 0xFE200000  // Raspberry Pi 4's GPIO base address (not RPi 5)
 
 // Storage configuration
 #define SD_CARD_PATH "/home/pi/gpio_data"  // Directory to store data files

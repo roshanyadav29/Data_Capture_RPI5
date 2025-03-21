@@ -1,3 +1,5 @@
+#define _GNU_SOURCE     // Required for CPU affinity functions
+
 #include "../include/gpio_handler.h"
 #include "../config.h"
 #include <fcntl.h>
@@ -9,11 +11,9 @@
 #include <pthread.h>
 #include <poll.h>
 #include <time.h>
+#include <sched.h>      // For sched_yield() and CPU affinity
 #include "../include/buffer_manager.h"
 #include "../include/utils.h"
-#include <pthread.h>    // For thread functions
-#define _GNU_SOURCE     // Required for CPU affinity functions
-#include <sys/types.h>  // For basic types
 
 // Memory mapped GPIO
 static volatile uint32_t *gpio_map = NULL;
@@ -44,11 +44,10 @@ static struct timespec last_report_time;
 #define GPFEN    0x58  // Falling edge detect enable registers
 
 // For sysfs GPIO edge detection
-static char gpio_edge_path[64];
 static int gpio_fd = -1;
 
-// GPIO controller
-#define GPIO_BASE               (BCM2711_PERI_BASE + 0x200000)
+// RPi 4 peripheral base address - defined here since not in config.h
+#define BCM2711_PERI_BASE        0xFE000000  // This is the correct base for RPi 4
 
 // GPIO setup macros - RPi 4 specific
 #define INP_GPIO(g) *(gpio_map+((g)/10)) &= ~(7<<(((g)%10)*3))

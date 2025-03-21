@@ -16,7 +16,7 @@ $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(TARGET) $(OBJ)
 
 run: $(TARGET)
 	sudo ./$(TARGET)
