@@ -1,2 +1,3 @@
 *.o
 gpio_sampler
+tests

@@ -1,5 +1,3 @@
-#define _GNU_SOURCE     // Required for CPU affinity functions
-
 #include "../include/gpio_handler.h"
 #include "../config.h"
 #include <fcntl.h>
@@ -102,29 +100,32 @@ void gpio_init(void) {
     INP_GPIO(GPIO_DATA_PIN);  // Set as input
     INP_GPIO(GPIO_CLOCK_PIN); // Set as input
     
-    // Enable rising edge detection on the clock pin - RPi 4 specific method
+    // Enable rising edge detection on the clock pin
     int edge_reg = GPIO_CLOCK_PIN / 32;
     int edge_bit = 1 << (GPIO_CLOCK_PIN % 32);
     
-    // Enable rising edge detection
-    *(gpio_map + GPREN/4 + edge_reg) |= edge_bit;
+    // Enable rising edge detection - crucial for capturing edges
+    gpio_map[GPREN/4 + edge_reg] |= edge_bit;
     
-    // Enable pull-down on clock pin for clean edges - RPi 4 method
+    // Clear any pending events before we start
+    gpio_map[GPEDS/4 + edge_reg] = edge_bit;
+    
+    // Enable pull-down on data pin for clean signals
     // RPi 4 requires a different sequence than RPi 5
-    *(gpio_map + GPPUD/4) = 1;     // 1 = pull-down, 0 = disable, 2 = pull-up
+    gpio_map[GPPUD/4] = 1;     // 1 = pull-down, 0 = disable, 2 = pull-up
     
     // Wait 150 cycles – this provides the required setup time for the control signal
     for (volatile int i = 0; i < 150; i++);
     
     // Clock the control signal into the GPIO pads
-    *(gpio_map + (GPPUD+4)/4) = (1 << GPIO_CLOCK_PIN);
+    gpio_map[GPPUD/4 + 1] = (1 << GPIO_DATA_PIN);
     
     // Wait 150 cycles – this provides the required hold time for the control signal
     for (volatile int i = 0; i < 150; i++);
     
     // Remove the control signal
-    *(gpio_map + GPPUD/4) = 0;
-    *(gpio_map + (GPPUD+4)/4) = 0;
+    gpio_map[GPPUD/4] = 0;
+    gpio_map[GPPUD/4 + 1] = 0;
     
     log_info("GPIO initialized successfully");
     
@@ -153,40 +154,26 @@ void gpio_free_ram_buffer(void) {
     buffer_cleanup();
 }
 
+// Edge detection using mmap approach - efficient and stable
+
 static void* external_clock_capture_thread(void* arg) {
     (void)arg; // Suppress unused parameter warning
     
-    // Set CPU affinity to a specific core for better performance
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(3, &cpuset);  // Use core 3 (RPi 4 has 4 cores)
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    
-    // Set thread to real-time priority
+    // Set thread to real-time priority but not maximum
     struct sched_param param;
-    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO) / 2;
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
     
-    // Registers for direct memory access - RPi 4 specific
-    int clock_reg = GPEDS/4 + (GPIO_CLOCK_PIN / 32);
-    int clock_bit = 1 << (GPIO_CLOCK_PIN % 32);
-    int reg_offset = 13;  // GPIO LEVEL register
-    int data_bit = 1 << GPIO_DATA_PIN;
-    
-    // For sysfs approach
-    struct pollfd pfd;
-    char value[2];
+    // Registers for direct memory access - optimized for edge detection
+    int level_reg = GPLEV/4;      // GPIO level register (for reading pin values)
+    int event_reg = GPEDS/4 + (GPIO_CLOCK_PIN / 32);  // Event detect status register
+    int clock_bit = 1 << (GPIO_CLOCK_PIN % 32);       // Bit mask for clock pin
+    int data_bit = 1 << GPIO_DATA_PIN;                // Bit mask for data pin
     
     // Bit accumulation
     uint8_t byte_value = 0;
     uint8_t bit_count = 0;
     
-    // Set up polling if using sysfs approach
-    if (gpio_fd >= 0) {
-        pfd.fd = gpio_fd;
-        pfd.events = POLLPRI | POLLERR;
-    }
-
     // Get start time
     clock_gettime(CLOCK_MONOTONIC, &capture_start_time);
     last_report_time = capture_start_time;
@@ -202,11 +189,16 @@ static void* external_clock_capture_thread(void* arg) {
         }
     }
     
-    // Variables for diagnostic
+    // Variables for edge detection tracking and diagnostics
+    uint64_t edges_detected = 0;
     struct timespec last_edge_time;
     clock_gettime(CLOCK_MONOTONIC, &last_edge_time);
-    int missed_edges_counter = 0;
+    uint32_t missed_edges_counter = 0;
     
+    // For periodic OS yield to prevent freezing
+    struct timespec last_yield_time = last_edge_time;
+    
+    // Main capture loop
     while (capture_running && total_bytes_captured < RAM_BUFFER_SIZE) {
         // Check if current buffer chunk is full
         if (current_chunk->used >= current_chunk->size) {
@@ -221,85 +213,48 @@ static void* external_clock_capture_thread(void* arg) {
             }
         }
         
-        // Wait for rising edge on the clock pin
-        if (gpio_fd >= 0) {
-            // Use sysfs polling approach (more reliable but slower)
-            if (poll(&pfd, 1, 100) > 0) {
-                // Rising edge detected, read current value
-                lseek(gpio_fd, 0, SEEK_SET);
-                read(gpio_fd, value, 1);
+        // Check for clock edge using event detect register (hardware edge detection)
+        // This is the key to reliable edge detection without software polling
+        if (gpio_map[event_reg] & clock_bit) {
+            // Clear the event immediately to catch the next edge
+            gpio_map[event_reg] = clock_bit;
+            
+            // Hardware detected a rising edge
+            // Read data pin immediately
+            uint8_t data_value = (gpio_map[level_reg] & data_bit) ? 1 : 0;
+            
+            // Add bit to our byte (LSB first)
+            byte_value |= (data_value << bit_count);
+            bit_count++;
+            
+            if (bit_count == 8) {
+                // Store the complete byte
+                current_chunk->data[current_chunk->used++] = byte_value;
+                total_bytes_captured++;
                 
-                // Read data pin state using memory-mapped approach for speed
-                uint8_t data_value = (*(gpio_map + reg_offset) & data_bit) ? 1 : 0;
+                // Reset for next byte
+                bit_count = 0;
+                byte_value = 0;
                 
-                // Add bit to our byte (LSB first)
-                byte_value |= (data_value << bit_count);
-                bit_count++;
-                
-                if (bit_count == 8) {
-                    // Store the complete byte
-                    current_chunk->data[current_chunk->used++] = byte_value;
-                    total_bytes_captured++;
-                    
-                    // Reset for next byte
-                    bit_count = 0;
-                    byte_value = 0;
-                    
-                    sample_counter++;
-                }
-                
-                // Diagnostics
-                struct timespec current_edge_time;
-                clock_gettime(CLOCK_MONOTONIC, &current_edge_time);
-                
-                double edge_interval = (current_edge_time.tv_sec - last_edge_time.tv_sec) + 
-                                      (current_edge_time.tv_nsec - last_edge_time.tv_nsec) / 1000000000.0;
-                
-                if (edge_interval > 0.0001) { // More than 100 microseconds
-                    missed_edges_counter++;
-                    if (missed_edges_counter % 1000 == 0) {
-                        printf("Warning: Clock signal gaps detected. Last gap: %.6f seconds\n", edge_interval);
-                    }
-                }
-                
-                last_edge_time = current_edge_time;
+                sample_counter++;
             }
-        } else {
-            // Direct memory-mapped approach - optimized for RPi 4
-            if (*(gpio_map + clock_reg) & clock_bit) {
-                // Clear the event immediately to catch the next edge
-                *(gpio_map + clock_reg) = clock_bit;
-                
-                // Read data pin state - optimized for speed
-                uint8_t data_value = (*(gpio_map + reg_offset) & data_bit) ? 1 : 0;
-                
-                // Add bit to our byte (LSB first)
-                byte_value |= (data_value << bit_count);
-                bit_count++;
-                
-                if (bit_count == 8) {
-                    // Store the complete byte
-                    current_chunk->data[current_chunk->used++] = byte_value;
-                    total_bytes_captured++;
-                    
-                    // Reset for next byte
-                    bit_count = 0;
-                    byte_value = 0;
-                    
-                    sample_counter++;
-                }
-                
-                // Diagnostics
-                struct timespec current_edge_time;
-                clock_gettime(CLOCK_MONOTONIC, &current_edge_time);
-                
+            
+            // Track edge timing for diagnostics
+            edges_detected++;
+            
+            struct timespec current_edge_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_edge_time);
+            
+            // Only calculate timing every 1000 edges to reduce overhead
+            if (edges_detected % 1000 == 0) {
                 double edge_interval = (current_edge_time.tv_sec - last_edge_time.tv_sec) + 
                                       (current_edge_time.tv_nsec - last_edge_time.tv_nsec) / 1000000000.0;
+                double instantaneous_rate = 1000.0 / edge_interval;  // 1000 edges / time = rate
                 
-                if (edge_interval > 0.0001) { // More than 100 microseconds
+                if (edge_interval > 0.001) { // More than 1ms for 1000 edges is slow
                     missed_edges_counter++;
-                    if (missed_edges_counter % 1000 == 0) {
-                        printf("Warning: Clock signal gaps detected. Last gap: %.6f seconds\n", edge_interval);
+                    if (missed_edges_counter % 10 == 0) {
+                        printf("Clock rate: %.2f MHz\n", instantaneous_rate / 1000000.0);
                     }
                 }
                 
@@ -307,21 +262,33 @@ static void* external_clock_capture_thread(void* arg) {
             }
         }
         
-        // Do periodic progress reporting, but less frequently to reduce overhead
+        // Periodic yield to prevent system freeze - check time since last yield
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        
+        double time_since_yield = (now.tv_sec - last_yield_time.tv_sec) + 
+                               (now.tv_nsec - last_yield_time.tv_nsec) / 1000000000.0;
+        
+        // Yield to the OS every 20ms - this prevents system freeze
+        // without significantly affecting capture rate (missing at most a few edges)
+        if (time_since_yield > 0.02) {  // 20ms
+            sched_yield();
+            last_yield_time = now;
+        }
+        
+        // Do periodic progress reporting
         time_check_counter++;
-        if (time_check_counter >= 1000000) { // Check less frequently
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            
+        if (time_check_counter >= 10000000) {  // Less frequent reporting
             double elapsed = (now.tv_sec - capture_start_time.tv_sec) + 
                             (now.tv_nsec - capture_start_time.tv_nsec) / 1000000000.0;
                             
-            double rate = sample_counter * 8 / elapsed; // bits per second
+            double rate = sample_counter * 8 / elapsed;  // bits per second
             
-            printf("Captured: %.2f MB (%.2f%%), Rate: %.2f MHz\n", 
+            printf("Captured: %.2f MB (%.2f%%), Rate: %.2f MHz, Edges: %llu\n", 
                    (float)total_bytes_captured / (1024 * 1024),
                    100.0 * total_bytes_captured / RAM_BUFFER_SIZE,
-                   rate / 1000000.0);
+                   rate / 1000000.0,
+                   (unsigned long long)edges_detected);
                    
             // If we've captured enough data or reached the time limit
             if (total_bytes_captured >= RAM_BUFFER_SIZE || 
@@ -352,7 +319,7 @@ static void* external_clock_capture_thread(void* arg) {
     printf("  Average rate: %.2f MHz (%.1f%% of target)\n", 
            bits_per_second / 1000000.0, 
            100.0 * bits_per_second / (TARGET_SAMPLE_RATE));
-    printf("  Clock signal gaps detected: %d\n", missed_edges_counter);
+    printf("  Total edges detected: %llu\n", (unsigned long long)edges_detected);
     
     return NULL;
 }
@@ -498,18 +465,27 @@ uint32_t gpio_get_actual_sample_rate(void) {
 bool gpio_debug_clock_signal(int seconds) {
     printf("Testing clock signal for %d seconds...\n", seconds);
     
-    int clock_reg = GPEDS/4 + (GPIO_CLOCK_PIN / 32);
+    // Register for edge detection
+    int event_reg = GPEDS/4 + (GPIO_CLOCK_PIN / 32);
     int clock_bit = 1 << (GPIO_CLOCK_PIN % 32);
     
     uint64_t edge_count = 0;
-    struct timespec start_time, current_time;
+    struct timespec start_time, current_time, last_yield_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
+    last_yield_time = start_time;
+    
+    // Clear any pending events before we start
+    gpio_map[event_reg] = clock_bit;
+    
+    // Report frequency every quarter second
+    double last_report_time = 0;
+    uint64_t last_report_count = 0;
     
     while (1) {
-        // Check for rising edge
-        if (*(gpio_map + clock_reg) & clock_bit) {
+        // Check for rising edge using hardware edge detection
+        if (gpio_map[event_reg] & clock_bit) {
             // Clear the event
-            *(gpio_map + clock_reg) = clock_bit;
+            gpio_map[event_reg] = clock_bit;
             edge_count++;
         }
         
@@ -522,10 +498,26 @@ bool gpio_debug_clock_signal(int seconds) {
             break;
         }
         
-        // Print status every second
-        if ((int)elapsed > (int)(elapsed - 0.1)) {
-            double rate = edge_count / elapsed;
-            printf("Clock rate: %.2f MHz\n", rate / 1000000.0);
+        // Print status every 0.25 second with instantaneous rate
+        if (elapsed - last_report_time >= 0.25) {
+            double interval = elapsed - last_report_time;
+            uint64_t edges = edge_count - last_report_count;
+            double rate = edges / interval;
+            
+            printf("Clock rate: %.2f MHz (%.0f edges in %.2fs)\n", 
+                  rate / 1000000.0, (double)edges, interval);
+            
+            last_report_time = elapsed;
+            last_report_count = edge_count;
+        }
+        
+        // Yield periodically to prevent system freeze
+        double time_since_yield = (current_time.tv_sec - last_yield_time.tv_sec) + 
+                                 (current_time.tv_nsec - last_yield_time.tv_nsec) / 1000000000.0;
+        
+        if (time_since_yield > 0.02) {  // 20ms
+            sched_yield();
+            last_yield_time = current_time;
         }
     }
     
